@@ -1,37 +1,62 @@
 import asyncio
+import json
 from typing import Optional
 from contextlib import AsyncExitStack
-
+import os
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from anthropic import Anthropic
+from openai import OpenAI
+from openai.types.chat import (
+    ChatCompletionToolParam,
+)
+from openai.types.shared_params.function_definition import FunctionDefinition
+
 from dotenv import load_dotenv
 
-load_dotenv()  # load environment variables from .env
+load_dotenv() 
+
 
 class MCPClient:
     def __init__(self):
         # Initialize session and client objects
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
-        self.anthropic = Anthropic()
+        self.model_id = os.getenv("MODEL_ID", "openai/gpt-4o-mini")
+        print(f"\nUsing model ID: {self.model_id}")
+        self.client = OpenAI(
+            base_url=os.getenv("BASE_URL", "https://openrouter.ai/api/v1"),
+            api_key=os.getenv("API_KEY"),
+        )
+        print(f"\nUsing base URL: {self.client.base_url}")
+        print(f"\nUsing API key: {self.client.api_key}")
 
     async def connect_to_server(self, server_script_path: str):
         """Connect to an MCP server
         
         Args:
-            server_script_path: Path to the server script (.py or .js)
+            server_script_path: Path to the server script (.py)
         """
         is_python = server_script_path.endswith('.py')
-        is_js = server_script_path.endswith('.js')
-        if not (is_python or is_js):
-            raise ValueError("Server script must be a .py or .js file")
+        if not (is_python):
+            raise ValueError("Server script must be a .py file")
+        
+        # Get the script path without the file name
+        script_path = server_script_path.rsplit('/', 1)[0]
+
+        # Get the file name
+        file_name = server_script_path.rsplit('/', 1)[-1]
             
-        command = "python" if is_python else "node"
+        command = "uv"
         server_params = StdioServerParameters(
             command=command,
-            args=[server_script_path],
+            args=[
+                "--directory",
+                script_path,
+                "run",
+                "python",
+                file_name
+            ],
             env=None
         )
         
@@ -56,53 +81,66 @@ class MCPClient:
         ]
 
         response = await self.session.list_tools()
-        available_tools = [{ 
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.inputSchema
-        } for tool in response.tools]
+
+        tools = [
+            ChatCompletionToolParam(
+                type="function",
+                function=FunctionDefinition(
+                    name=tool.name,
+                    description=tool.description if tool.description else "",
+                    parameters=tool.inputSchema,
+                ),
+            )
+            for tool in (await self.session.list_tools()).tools
+        ]
 
         # Initial Claude API call
-        response = self.anthropic.messages.create(
-            model="claude-3-5-sonnet-20241022",
+        response = self.client.chat.completions.create(
+            model=self.model_id,
             max_tokens=1000,
             messages=messages,
-            tools=available_tools
-        )
+            tools=tools,
+        ).choices[0].message
 
         # Process response and handle tool calls
         final_text = []
 
-        for content in response.content:
-            if content.type == 'text':
-                final_text.append(content.text)
-            elif content.type == 'tool_use':
-                tool_name = content.name
-                tool_args = content.input
-                
+        if response.content:
+            final_text.append(response.content)
+        else:
+            for tool_call in response.tool_calls:
+                messages.append(response)
+
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+                # print(f"\nCalling tool {tool_name} with args {tool_args}")
+
                 # Execute tool call
                 result = await self.session.call_tool(tool_name, tool_args)
-                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+
+                # print(f"\nTool {tool_name} result: {result}")
 
                 # Continue conversation with tool results
-                if hasattr(content, 'text') and content.text:
-                    messages.append({
-                      "role": "assistant",
-                      "content": content.text
-                    })
                 messages.append({
-                    "role": "user", 
-                    "content": result.content
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": tool_name,
+                    "content": json.dumps([content.model_dump() for content in result.content]),
                 })
 
-                # Get next response from Claude
-                response = self.anthropic.messages.create(
-                    model="claude-3-5-sonnet-20241022",
+                # print(f"\nMessages after tool call: {messages}")
+
+                response = self.client.chat.completions.create(
+                    model=self.model_id,
                     max_tokens=1000,
                     messages=messages,
-                )
+                    tools=result.content[0].text,
+                ).choices[0].message
 
-                final_text.append(response.content[0].text)
+                # print(f"\nResponse after tool call: {response}")
+
+                final_text.append(response.content)
 
         return "\n".join(final_text)
 
@@ -129,6 +167,7 @@ class MCPClient:
         await self.exit_stack.aclose()
 
 async def main():
+
     if len(sys.argv) < 2:
         print("Usage: python client.py <path_to_server_script>")
         sys.exit(1)
