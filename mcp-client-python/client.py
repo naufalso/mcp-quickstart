@@ -1,21 +1,16 @@
 import asyncio
 import json
+import os
 from typing import Optional
 from contextlib import AsyncExitStack
-import os
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-
 from openai import OpenAI
-from openai.types.chat import (
-    ChatCompletionToolParam,
-)
+from openai.types.chat import ChatCompletionToolParam
 from openai.types.shared_params.function_definition import FunctionDefinition
-
 from dotenv import load_dotenv
 
 load_dotenv() 
-
 
 class MCPClient:
     def __init__(self):
@@ -29,7 +24,6 @@ class MCPClient:
             api_key=os.getenv("API_KEY"),
         )
         print(f"\nUsing base URL: {self.client.base_url}")
-        print(f"\nUsing API key: {self.client.api_key}")
 
     async def connect_to_server(self, server_script_path: str):
         """Connect to an MCP server
@@ -109,17 +103,15 @@ class MCPClient:
             final_text.append(response.content)
         else:
             for tool_call in response.tool_calls:
+                # Add tool call to messages
                 messages.append(response)
 
                 tool_name = tool_call.function.name
                 tool_args = json.loads(tool_call.function.arguments)
                 final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
-                # print(f"\nCalling tool {tool_name} with args {tool_args}")
 
                 # Execute tool call
                 result = await self.session.call_tool(tool_name, tool_args)
-
-                # print(f"\nTool {tool_name} result: {result}")
 
                 # Continue conversation with tool results
                 messages.append({
@@ -129,16 +121,12 @@ class MCPClient:
                     "content": json.dumps([content.model_dump() for content in result.content]),
                 })
 
-                # print(f"\nMessages after tool call: {messages}")
-
                 response = self.client.chat.completions.create(
                     model=self.model_id,
                     max_tokens=1000,
                     messages=messages,
                     tools=result.content[0].text,
                 ).choices[0].message
-
-                # print(f"\nResponse after tool call: {response}")
 
                 final_text.append(response.content)
 
